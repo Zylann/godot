@@ -17,6 +17,9 @@ subject to the following restrictions:
 #define BT_HEIGHTFIELD_TERRAIN_SHAPE_H
 
 #include "btConcaveShape.h"
+#include "LinearMath/btAlignedObjectArray.h"
+
+struct QuadTreeNode;
 
 ///btHeightfieldTerrainShape simulates a 2D heightfield terrain
 /**
@@ -100,8 +103,11 @@ protected:
 	
 	btVector3	m_localScaling;
 
+	QuadTreeNode *m_rootQuadTreeNode;
+	int m_minNodeSize;
+	int m_maxDepth;
+
 	virtual btScalar	getRawHeightFieldValue(int x,int y) const;
-	void		quantizeWithClamp(int* out, const btVector3& point,int isMax) const;
 	void		getVertex(int x,int y,btVector3& vertex) const;
 
 
@@ -115,6 +121,10 @@ protected:
 	                const void* heightfieldData, btScalar heightScale,
 	                btScalar minHeight, btScalar maxHeight, int upAxis,
 	                PHY_ScalarType heightDataType, bool flipQuadEdges);
+
+	void buildNodes(QuadTreeNode* parent,int depth,int maxDepth,int minNodeSize,int xAxis,int yAxis,int zAxis);
+
+	void queryNode(const QuadTreeNode* node, btAlignedObjectArray<const QuadTreeNode*>& results, const btVector3& src,const btVector3& direction) const;
 
 public:
 	
@@ -159,6 +169,15 @@ public:
 	
 	virtual const btVector3& getLocalScaling() const;
 	
+	void performRaycast (btTriangleCallback* callback, const btVector3& raySource, const btVector3& rayTarget) const;
+	void performRaycast2(btTriangleCallback* callback, const btVector3& raySource, const btVector3& rayTarget) const;
+
+	bool hasAccelerator() const;
+
+	void buildAccelerator(int maxDepth=5,int minNodeSize=4);
+	void inspectVertexHeights(int startX, int endX, int startZ, int endZ, btScalar& min, btScalar& max) const;
+	void quantizeWithClamp(int* out, const btVector3& point,int isMax) const;
+
 	//debugging
 	virtual const char*	getName()const {return "HEIGHTFIELD";}
 

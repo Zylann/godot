@@ -16,7 +16,9 @@ subject to the following restrictions:
 #include "btHeightfieldTerrainShape.h"
 
 #include "LinearMath/btTransformUtil.h"
+#include "LinearMath/btAlignedObjectArray.h"
 
+#include <stdio.h>
 
 
 btHeightfieldTerrainShape::btHeightfieldTerrainShape
@@ -83,6 +85,9 @@ PHY_ScalarType hdt, bool flipQuadEdges
 	m_useZigzagSubdivision = false;
 	m_upAxis = upAxis;
 	m_localScaling.setValue(btScalar(1.), btScalar(1.), btScalar(1.));
+	m_rootQuadTreeNode = 0;
+	m_minNodeSize = 0;
+	m_maxDepth = 0;
 
 	// determine min/max axis-aligned bounding box (aabb) values
 	switch (m_upAxis)
@@ -120,6 +125,11 @@ PHY_ScalarType hdt, bool flipQuadEdges
 
 btHeightfieldTerrainShape::~btHeightfieldTerrainShape()
 {
+	if(m_rootQuadTreeNode)
+	{
+		btAlignedFree(m_rootQuadTreeNode);
+		m_rootQuadTreeNode = NULL;
+	}
 }
 
 
@@ -406,4 +416,480 @@ void	btHeightfieldTerrainShape::setLocalScaling(const btVector3& scaling)
 const btVector3& btHeightfieldTerrainShape::getLocalScaling() const
 {
 	return m_localScaling;
+}
+
+ATTRIBUTE_ALIGNED16(struct) QuadTreeNode
+{
+	QuadTreeNode* children[4];
+	btVector3 vmin;
+	btVector3 vmax;
+
+	BT_DECLARE_ALIGNED_ALLOCATOR();
+
+	QuadTreeNode(const btVector3& minv, const btVector3& maxv)
+	{
+		vmin = minv;
+		vmax = maxv;
+		children[0] = 0;
+		children[1] = 0;
+		children[2] = 0;
+		children[3] = 0;
+	}
+
+	QuadTreeNode(const btVector3& minv, const btVector3& maxv,int xAxis, int yAxis, int zAxis, float xDiff, float zDiff,bool x,bool z)
+	{
+		vmin = minv;
+		vmax = maxv;
+		vmin[xAxis] += (x ? xDiff : 0);
+		vmin[zAxis] += (z ? zDiff : 0);
+		vmax[xAxis] = vmin[xAxis] + xDiff;
+		vmax[zAxis] = vmin[zAxis] + zDiff;
+		vmin[yAxis] = 100000;
+		vmax[yAxis] = -100000;
+		children[0] = 0;
+		children[1] = 0;
+		children[2] = 0;
+		children[3] = 0;
+	}
+
+	~QuadTreeNode()
+	{
+		btAlignedFree(children[0]);
+		btAlignedFree(children[1]);
+		btAlignedFree(children[2]);
+		btAlignedFree(children[3]);
+	}
+
+	bool intersects(const btVector3& source, const btVector3& direction)
+	{
+		//return true;
+
+		btScalar num1 = 0.0f;
+		btScalar num2 = SIMD_INFINITY;
+		if ( btFabs(direction.x()) < 9.99999997475243E-07)
+		{
+			if (source.x() < vmin.x() || source.x() > vmax.x())
+			{
+				return false;
+			}
+		}
+		else
+		{
+			btScalar num3 = btScalar(1) / direction.x();
+			btScalar num4 = (vmin.x() - source.x()) * num3;
+			btScalar num5 = (vmax.x()- source.x()) * num3;
+			if ( num4 >  num5)
+			{
+				btScalar num6 = num4;
+				num4 = num5;
+				num5 = num6;
+			}
+			num1 = (num4 > num1) ? num4:num1;
+			num2 = (num5 < num2) ?num5 : num2;
+
+
+			if ( num1 >  num2)
+			{
+				return false;
+			}
+		}
+		if ( btFabs(direction.y()) < 9.99999997475243E-07)
+		{
+			if ( source.y() <  vmin.y() ||  source.y() >  vmax.y())
+				return false;
+		}
+		else
+		{
+			btScalar num3 = btScalar(1) / direction.y();
+			btScalar num4 = (vmin.y() - source.y()) * num3;
+			btScalar num5 = (vmax.y() - source.y()) * num3;
+			if ( num4 >  num5)
+			{
+				btScalar num6 = num4;
+				num4 = num5;
+				num5 = num6;
+			}
+			num1 = (num4 > num1)? num4:num1;
+			num2 = (num5< num2)?num5:num2;
+			if ( num1 >  num2)
+			{
+				return false;
+			}
+		}
+		if ( btFabs(direction.z()) < 9.99999997475243E-07)
+		{
+			if ( source.z() <  vmin.z() ||  source.z() >  vmax.z())
+			{
+				return false;
+			}
+		}
+		else
+		{
+			btScalar num3 = btScalar(1) / direction.z();
+			btScalar num4 = (vmin.z() - source.z()) * num3;
+			btScalar num5 = (vmax.z() - source.z()) * num3;
+			if ( num4 >  num5)
+			{
+				btScalar num6 = num4;
+				num4 = num5;
+				num5 = num6;
+			}
+
+			num1 = (num4 > num1)?num4:num1;
+			btScalar num7 = (num5 < num2)? num5:num2;
+			if ( num1 >  num7)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	void adjustHeightValues(int xAxis,int yAxis,int zAxis,btScalar& min,btScalar& max,btHeightfieldTerrainShape* shape)
+	{
+		if (!children[0])
+		{
+
+			min = vmin[yAxis];
+			max = vmax[yAxis];
+
+			int clampedMin[3];
+			int clampedMax[3];
+
+			shape->quantizeWithClamp(clampedMin, vmin, 0);
+			shape->quantizeWithClamp(clampedMax, vmax, 1);
+
+			shape->inspectVertexHeights(clampedMin[xAxis], clampedMax[xAxis], clampedMin[zAxis], clampedMax[zAxis], min, max);
+
+			vmin[yAxis] = min;
+			vmax[yAxis] = max;
+		}
+		else
+		{
+			btScalar newMin = 10000;
+			btScalar newMax = -10000;
+
+			children[0]->adjustHeightValues(xAxis,yAxis, zAxis, newMin,  newMax,shape);
+			if (newMin < min)
+			{
+				min = newMin;
+			}
+			if (newMax > max)
+			{
+				max = newMax;
+			}
+
+			newMin = 10000;
+			newMax = -10000;
+			children[1]->adjustHeightValues(xAxis, yAxis, zAxis,  newMin,  newMax, shape);
+			if (newMin < min)
+			{
+				min = newMin;
+			}
+			if (newMax > max)
+			{
+				max = newMax;
+			}
+
+			newMin = 10000;
+			newMax = -10000;
+			children[2]->adjustHeightValues(xAxis, yAxis, zAxis,  newMin,  newMax, shape);
+			if (newMin < min)
+			{
+				min = newMin;
+			}
+			if (newMax > max)
+			{
+				max = newMax;
+			}
+
+			newMin = 10000;
+			newMax = -10000;
+			children[3]->adjustHeightValues(xAxis, yAxis, zAxis,  newMin,  newMax, shape);
+			if (newMin < min)
+			{
+				min = newMin;
+			}
+			if (newMax > max)
+			{
+				max = newMax;
+			}
+
+			vmin[yAxis] = min;
+			vmax[yAxis] = max;
+
+		}
+	}
+};
+
+void btHeightfieldTerrainShape::buildAccelerator(int maxDepth,int minNodeSize)
+{
+	if(m_rootQuadTreeNode)
+	{
+		btAlignedFree(m_rootQuadTreeNode);
+		m_rootQuadTreeNode = NULL;
+	}
+
+	m_maxDepth = maxDepth;
+	m_minNodeSize = minNodeSize;
+
+	int xAxis = 0;
+	int yAxis = 1;
+	int zAxis = 2;
+
+	// need these as quantized vals?
+	btScalar min = 100000;
+	btScalar max = -100000;
+
+	if (m_upAxis == 0)
+	{
+		xAxis = 1;
+		yAxis = 0;
+		zAxis = 2;
+	}
+	else if (m_upAxis == 2)
+	{
+		xAxis = 0;
+		yAxis = 2;
+		zAxis = 1;
+	}
+
+	if(m_rootQuadTreeNode)
+	{
+		delete m_rootQuadTreeNode;
+	}
+	m_rootQuadTreeNode = new(btAlignedAlloc(sizeof(QuadTreeNode),16)) QuadTreeNode(m_localAabbMin,m_localAabbMax);
+
+	buildNodes(m_rootQuadTreeNode, 0, maxDepth, minNodeSize, xAxis, yAxis, zAxis);
+	// cheat second pass to rebuild heights.
+	// adjust heights.
+	m_rootQuadTreeNode->adjustHeightValues(xAxis,yAxis, zAxis,min, max,this);
+}
+
+
+void btHeightfieldTerrainShape::buildNodes(QuadTreeNode* parent,int depth,int maxDepth,int minNodeSize,int xAxis,int yAxis,int zAxis)
+{
+	if (depth < maxDepth)
+	{
+		if (!parent->children[0])
+		{
+			btVector3 diff = (parent->vmax - parent->vmin) /2;
+
+			// don't split too low.
+			if (diff[xAxis] >= minNodeSize || diff[zAxis] >= minNodeSize)
+			{
+				//split nodes
+
+				parent->children[0] = new(btAlignedAlloc(sizeof(QuadTreeNode),16)) QuadTreeNode(parent->vmin,parent->vmax, xAxis, yAxis, zAxis, diff[xAxis], diff[zAxis], false, false);
+				buildNodes(parent->children[0], depth + 1, maxDepth, minNodeSize,xAxis, yAxis, zAxis);
+				parent->children[1] = new(btAlignedAlloc(sizeof(QuadTreeNode),16)) QuadTreeNode(parent->vmin,parent->vmax, xAxis, yAxis, zAxis, diff[xAxis], diff[zAxis], true, false);
+				buildNodes(parent->children[1], depth + 1, maxDepth, minNodeSize, xAxis, yAxis, zAxis);
+				parent->children[2] = new(btAlignedAlloc(sizeof(QuadTreeNode),16)) QuadTreeNode(parent->vmin,parent->vmax, xAxis, yAxis, zAxis, diff[xAxis], diff[zAxis], false, true);
+				buildNodes(parent->children[2], depth + 1, maxDepth, minNodeSize, xAxis, yAxis, zAxis);
+				parent->children[3] = new(btAlignedAlloc(sizeof(QuadTreeNode),16)) QuadTreeNode(parent->vmin, parent->vmax,xAxis, yAxis, zAxis, diff[xAxis], diff[zAxis], true, true);
+				buildNodes(parent->children[3], depth + 1, maxDepth, minNodeSize, xAxis, yAxis, zAxis);
+			}
+		}
+	}
+}
+
+
+
+void btHeightfieldTerrainShape::queryNode(const QuadTreeNode* node, btAlignedObjectArray<const QuadTreeNode*>& results, const btVector3& src,const btVector3& direction) const
+{
+	//if(node.children == null && node.Intersects(raySource,rayTarget))
+	// add the lowest level.
+
+	if (!node->children[0])
+	{
+		results.push_back(node);
+	}
+	else
+	{
+		// simple rescursive for now.
+		for (int i = 0; i < 4; ++i)
+		{
+			if (node->children[i]->intersects(src,direction))
+			{
+				queryNode(node->children[i], results, src,direction);
+			}
+		}
+	}
+}
+
+
+void btHeightfieldTerrainShape::performRaycast (btTriangleCallback* callback, const btVector3& raySource, const btVector3& rayTarget) const
+{
+	// if no accelerator then do the normal process triangles call.
+	if(!hasAccelerator())
+	{
+		btVector3 rayAabbMinLocal = raySource;
+		rayAabbMinLocal.setMin(rayTarget);
+		btVector3 rayAabbMaxLocal = raySource;
+		rayAabbMaxLocal.setMax(rayTarget);
+		processAllTriangles(callback,rayAabbMinLocal,rayAabbMaxLocal);
+	}
+	else
+	{
+		// if the ray is short then don't go through the acclerator either as the node set
+		// to check will be small
+		btScalar rayLength2 = rayTarget.distance2(raySource);
+		int checkNode = 0;
+		if (m_upAxis == 0)
+		{
+			checkNode = 1;
+		}
+
+		if (rayLength2 < m_minNodeSize * m_localScaling[checkNode])
+		{
+			btVector3 rayAabbMinLocal = raySource;
+			rayAabbMinLocal.setMin(rayTarget);
+			btVector3 rayAabbMaxLocal = raySource;
+			rayAabbMaxLocal.setMax(rayTarget);
+			processAllTriangles(callback,rayAabbMinLocal,rayAabbMaxLocal);
+		}
+		else
+		{
+			btVector3	srcCopy = raySource*btVector3(1.f/m_localScaling[0],1.f/m_localScaling[1],1.f/m_localScaling[2]);
+			btVector3	targetCopy = rayTarget*btVector3(1.f/m_localScaling[0],1.f/m_localScaling[1],1.f/m_localScaling[2]);
+
+			// account for local origin
+			srcCopy += m_localOrigin;
+			targetCopy += m_localOrigin;
+
+
+			// build list of squares
+
+			btVector3 direction = (targetCopy-srcCopy).normalize();
+			btAlignedObjectArray<const QuadTreeNode*> results;
+			queryNode(m_rootQuadTreeNode, results, srcCopy,direction);
+
+
+			// go through each of the results.
+			for(int i=0;i<results.size();++i)
+			{
+				const QuadTreeNode* quadTreeNode = results[i];
+
+				//quantize the aabbMin and aabbMax, and adjust the start/end ranges
+				int	quantizedAabbMin[3];
+				int	quantizedAabbMax[3];
+				quantizeWithClamp(quantizedAabbMin, quadTreeNode->vmin,0);
+				quantizeWithClamp(quantizedAabbMax, quadTreeNode->vmax,1);
+
+				// expand the min/max quantized values
+				// this is to catch the case where the input aabb falls between grid points!
+				for (int i = 0; i < 3; ++i) {
+					quantizedAabbMin[i]--;
+					quantizedAabbMax[i]++;
+				}
+
+				int startX = 0;
+				int endX = m_heightStickWidth - 1;
+				int startJ = 0;
+				int endJ = m_heightStickLength - 1;
+
+				switch (m_upAxis)
+				{
+				case 0:
+					{
+						if (quantizedAabbMin[1]>startX)
+							startX = quantizedAabbMin[1];
+						if (quantizedAabbMax[1]<endX)
+							endX = quantizedAabbMax[1];
+						if (quantizedAabbMin[2]>startJ)
+							startJ = quantizedAabbMin[2];
+						if (quantizedAabbMax[2]<endJ)
+							endJ = quantizedAabbMax[2];
+						break;
+					}
+				case 1:
+					{
+						if (quantizedAabbMin[0]>startX)
+							startX = quantizedAabbMin[0];
+						if (quantizedAabbMax[0]<endX)
+							endX = quantizedAabbMax[0];
+						if (quantizedAabbMin[2]>startJ)
+							startJ = quantizedAabbMin[2];
+						if (quantizedAabbMax[2]<endJ)
+							endJ = quantizedAabbMax[2];
+						break;
+					};
+				case 2:
+					{
+						if (quantizedAabbMin[0]>startX)
+							startX = quantizedAabbMin[0];
+						if (quantizedAabbMax[0]<endX)
+							endX = quantizedAabbMax[0];
+						if (quantizedAabbMin[1]>startJ)
+							startJ = quantizedAabbMin[1];
+						if (quantizedAabbMax[1]<endJ)
+							endJ = quantizedAabbMax[1];
+						break;
+					}
+				}
+
+				btVector3 vertices[3];
+				for (int j = startJ; j < endJ; j++)
+				{
+					for (int x = startX; x < endX; x++)
+					{
+						if (m_flipQuadEdges || (m_useDiamondSubdivision && (((j + x) & 1) > 0)))
+						{
+							//first triangle
+							getVertex(x, j, vertices[0]);
+							getVertex(x + 1, j, vertices[1]);
+							getVertex(x + 1, j + 1, vertices[2]);
+							callback->processTriangle(vertices, x, j);
+							//second triangle
+							getVertex(x, j, vertices[0]);
+							getVertex(x + 1, j + 1, vertices[1]);
+							getVertex(x, j + 1, vertices[2]);
+
+							callback->processTriangle(vertices, x, j);
+						}
+						else
+						{
+							//first triangle
+							getVertex(x, j, vertices[0]);
+							getVertex(x, j + 1, vertices[1]);
+							getVertex(x + 1, j, vertices[2]);
+							callback->processTriangle(vertices, x, j);
+
+							//second triangle
+							getVertex(x + 1, j, vertices[0]);
+							getVertex(x, j + 1, vertices[1]);
+							getVertex(x + 1, j + 1, vertices[2]);
+							callback->processTriangle(vertices, x, j);
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+bool btHeightfieldTerrainShape::hasAccelerator() const
+{
+	return m_rootQuadTreeNode != 0;
+}
+
+
+void btHeightfieldTerrainShape::inspectVertexHeights(int startX,int endX,int startZ,int endZ,btScalar& min,btScalar& max) const
+{
+	for (int z = startZ; z <= endZ; z++)
+	{
+		for (int x = startX; x <= endX; x++)
+		{
+			btScalar height = getRawHeightFieldValue(x, z);
+
+			if (height < min)
+			{
+				min = height;
+			}
+			if (height > max)
+			{
+				max = height;
+			}
+		}
+	}
 }
